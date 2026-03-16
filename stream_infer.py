@@ -1689,6 +1689,8 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
         print(f"  [pin] Online expert pinning enabled: warmup={pin_experts} tokens, "
               f"topk={pin_topk}/layer, num_experts={num_experts_total}")
 
+    _io_pool = ThreadPoolExecutor(max_workers=8)  # reuse across tokens+layers
+
     for token_idx in range(max_tokens):
         t_token_start = time.perf_counter() if profile else time.time()
 
@@ -1846,23 +1848,32 @@ def generate_offload_selective(model, tokenizer, prompt, max_tokens, weight_inde
 
                     # Read only unpinned experts from disk
                     if packed_layout is not None and i in packed_layers:
-                        # PACKED PATH: 1 contiguous pread per expert (1.9x faster)
+                        # PACKED PATH: separated I/O (threaded) then conversion (serial)
+                        # Phase 1: parallel pread — GIL released during I/O
                         packed_fd = packed_fds[i]
-                        num_unpinned = len(unpinned_list)
-                        with ThreadPoolExecutor(max_workers=min(8, num_unpinned)) as executor:
-                            futures = [
-                                executor.submit(read_expert_packed, packed_fd, packed_layout, eidx)
-                                for eidx in unpinned_list
-                            ]
-                            for future in futures:
-                                eidx, attrs, io_stats = future.result()
-                                all_expert_attrs[eidx] = attrs
-                                token_io_bytes += io_stats["bytes_read"]
-                                token_io_seeks += io_stats["seek_count"]
-                                token_io_time += io_stats["io_time_s"]
-                                token_array_time += io_stats["array_time_s"]
-                                if profile:
-                                    layer_io_bytes += io_stats["bytes_read"]
+                        es = packed_layout["expert_size"]
+                        def _just_read(eidx):
+                            return eidx, os.pread(packed_fd, es, eidx * es)
+                        raw_buffers = list(_io_pool.map(_just_read, unpinned_list))
+                        # Phase 2: serial conversion — no I/O, just CPU
+                        for eidx, raw in raw_buffers:
+                            mv = memoryview(raw)
+                            attrs = {}
+                            for comp in packed_layout["components"]:
+                                parts = comp["name"].split(".")
+                                chunk = mv[comp["offset"]:comp["offset"]+comp["size"]]
+                                np_dtype, _ = _PREAD_NP_DTYPE[comp["dtype"]]
+                                np_arr = np.frombuffer(chunk, dtype=np_dtype).reshape(comp["shape"])
+                                if comp["dtype"] == 'BF16':
+                                    np_f32 = (np_arr.astype(np.uint32) << 16).view(np.float32)
+                                    attrs[(parts[0], parts[1])] = mx.array(np_f32).astype(mx.bfloat16)
+                                else:
+                                    attrs[(parts[0], parts[1])] = mx.array(np_arr)
+                            all_expert_attrs[eidx] = attrs
+                            token_io_bytes += es
+                            token_io_seeks += 1
+                            if profile:
+                                layer_io_bytes += es
                     else:
                         # SCATTERED PATH: 9 preads per expert from safetensors
                         num_unpinned = len(unpinned_list)
