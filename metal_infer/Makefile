@@ -5,8 +5,10 @@
 #   make run      — single expert forward pass
 #   make verify   — verify Metal vs CPU reference
 #   make bench    — benchmark single expert (10 iterations)
-#   make moe      — full MoE forward pass (10 experts)
+#   make moe      — full MoE forward pass (K experts, single layer)
 #   make moebench — benchmark MoE (10 iterations)
+#   make full     — full 60-layer MoE forward pass (K=4)
+#   make fullbench — benchmark full 60-layer forward (3 iterations)
 #   make clean    — remove build artifacts
 #
 # Note: Metal shaders are compiled from source at runtime via
@@ -15,6 +17,7 @@
 CC = clang
 CFLAGS = -O2 -Wall -Wextra -fobjc-arc
 FRAMEWORKS = -framework Metal -framework Foundation
+LDFLAGS = -lpthread
 
 TARGET = metal_infer
 MAIN_SRC = main.m
@@ -26,13 +29,13 @@ SHADER_SRC = shaders.metal
 SHADER_AIR = shaders.air
 SHADER_LIB = shaders.metallib
 
-.PHONY: all clean run verify bench moe moebench fast metallib
+.PHONY: all clean run verify bench moe moebench full fullbench fast metallib
 
 all: $(TARGET)
 
 # Build the binary (shaders compiled at runtime from source)
 $(TARGET): $(MAIN_SRC) $(SHADER_SRC)
-	$(CC) $(CFLAGS) $(FRAMEWORKS) $(MAIN_SRC) -o $(TARGET)
+	$(CC) $(CFLAGS) $(FRAMEWORKS) $(LDFLAGS) $(MAIN_SRC) -o $(TARGET)
 
 # Optional: pre-compile shaders (not required — runtime compilation is the default)
 metallib: $(SHADER_LIB)
@@ -64,3 +67,9 @@ moe: $(TARGET)
 
 moebench: $(TARGET)
 	./$(TARGET) --layer 0 --fast --moe --benchmark
+
+full: $(TARGET)
+	./$(TARGET) --fast --full --k 4
+
+fullbench: $(TARGET)
+	./$(TARGET) --fast --full --k 4 --benchmark
