@@ -616,32 +616,34 @@ static MoETiming run_moe_forward(
     MoETiming timing = {0};
     double t0 = now_ms();
 
-    // Allocate per-expert output buffers (use NSMutableArray for ARC)
-    NSMutableArray<id<MTLBuffer>> *expert_outs = [NSMutableArray arrayWithCapacity:K];
-    for (int k = 0; k < K; k++) {
-        [expert_outs addObject:metal_buf_shared(ctx, HIDDEN_DIM * sizeof(float))];
-    }
+    // Pre-allocate reusable buffers for optimized path
+    id<MTLBuffer> expert_buf = metal_buf_shared(ctx, EXPERT_SIZE);
+    id<MTLBuffer> gate_out = metal_buf_shared(ctx, INTERMEDIATE_DIM * sizeof(float));
+    id<MTLBuffer> up_out   = metal_buf_shared(ctx, INTERMEDIATE_DIM * sizeof(float));
+    id<MTLBuffer> act_out  = metal_buf_shared(ctx, INTERMEDIATE_DIM * sizeof(float));
 
-    // Run each expert
+    // Stacked outputs for weighted combination
+    id<MTLBuffer> stacked = metal_buf_shared(ctx, K * HIDDEN_DIM * sizeof(float));
+    id<MTLBuffer> expert_out = metal_buf_shared(ctx, HIDDEN_DIM * sizeof(float));
+
+    // Run each expert using optimized single-pread path
     for (int k = 0; k < K; k++) {
-        ExpertTiming et = run_expert_forward(ctx, packed_fd, expert_indices[k],
-                                              x_buf, expert_outs[k], use_fast);
+        ExpertTiming et = run_expert_forward_fast(ctx, packed_fd, expert_indices[k],
+                                                   expert_buf, x_buf,
+                                                   gate_out, up_out, act_out,
+                                                   expert_out, use_fast);
         timing.io_ms += et.io_ms;
         timing.compute_ms += et.compute_ms;
         timing.io_bytes += et.io_bytes;
+
+        // Copy this expert's output into the stacked buffer
+        memcpy((float *)[stacked contents] + k * HIDDEN_DIM,
+               [expert_out contents],
+               HIDDEN_DIM * sizeof(float));
     }
 
     // Combine: out = sum(w[k] * expert_out[k])
     double t_combine = now_ms();
-
-    // Stack expert outputs into contiguous buffer for the weighted_sum kernel
-    id<MTLBuffer> stacked = metal_buf_shared(ctx, K * HIDDEN_DIM * sizeof(float));
-    float *stacked_ptr = (float *)[stacked contents];
-    for (int k = 0; k < K; k++) {
-        memcpy(stacked_ptr + k * HIDDEN_DIM,
-               [expert_outs[k] contents],
-               HIDDEN_DIM * sizeof(float));
-    }
 
     // Upload weights
     id<MTLBuffer> w_buf = metal_buf_shared(ctx, K * sizeof(float));

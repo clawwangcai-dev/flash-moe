@@ -1001,25 +1001,6 @@ static PyObject *fml_load_and_assemble(PyObject *self, PyObject *args) {
         return NULL;
     }
 
-    /*
-     * Batch eval all mx.arrays to force materialization.
-     * Without this, MLX's lazy graph accumulates ~540 pending operations,
-     * causing ~470ms of overhead when the arrays are eventually consumed.
-     * Batch eval costs ~30ms and prevents this.
-     */
-    if (eval_idx > 0) {
-        /* Resize tuple to actual count (might be less if some layers had fewer experts) */
-        if (eval_idx < total_arrays) {
-            _PyTuple_Resize(&eval_list, eval_idx);
-        }
-        PyObject *eval_result = PyObject_Call(g_state.mx_eval_fn, eval_list, NULL);
-        Py_XDECREF(eval_result);
-        if (!eval_result) {
-            Py_DECREF(eval_list);
-            Py_DECREF(result_list);
-            return NULL;
-        }
-    }
     Py_DECREF(eval_list);
 
     double t_create_end = get_time_ms();

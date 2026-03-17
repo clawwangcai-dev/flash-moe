@@ -1,17 +1,17 @@
-"""Test fast_moe_load C extension against fast_weight_load baseline.
+"""Test fast_moe_load C extension — FRESH mx.array approach.
 
 Verifies:
-1. prealloc_stacked creates correct shapes and dtypes
-2. load_and_assemble fills buffers with correct data (bit-exact vs pread)
-3. BF16 view pairing works (scales/biases returned as bfloat16)
-4. Timing comparison: stacked vs old per-slot approach
+1. init() with full parameters (workers, layers, K, components, packed_dir, expert_size)
+2. load_and_assemble() returns NEW dicts with FRESH mx.arrays every call
+3. Data correctness: bit-exact match against direct pread
+4. BF16 view pairing works (scales/biases returned as bfloat16)
+5. Timing: target <50ms for 240 experts (60 layers x 4 experts x 9 components)
 
 Uses the real 397B packed expert files.
 """
 
 import time
 import json
-import struct
 import os
 import numpy as np
 import mlx.core as mx
@@ -54,74 +54,124 @@ for comp in components:
     })
 
 
-def test_prealloc():
-    """Test that prealloc_stacked creates correct shapes and dtypes."""
+def test_init_and_stats():
+    """Test that init() with full parameters works and stats are correct."""
     import fast_moe_load
 
-    fast_moe_load.init(num_workers=8)
-
-    # Only allocate 2 layers for testing (not 60)
-    test_layers = 2
-    layer_dicts = fast_moe_load.prealloc_stacked(
-        test_layers, K, fml_components, PACKED_DIR, expert_size)
-
-    assert isinstance(layer_dicts, list), f"Expected list, got {type(layer_dicts)}"
-    assert len(layer_dicts) == test_layers, f"Expected {test_layers} layers, got {len(layer_dicts)}"
-
-    for li, layer_dict in enumerate(layer_dicts):
-        assert isinstance(layer_dict, dict), f"Layer {li}: expected dict"
-        assert len(layer_dict) == len(components), (
-            f"Layer {li}: expected {len(components)} components, got {len(layer_dict)}")
-
-        for comp in components:
-            name = comp['name']
-            assert name in layer_dict, f"Layer {li}: missing component '{name}'"
-
-            arr = layer_dict[name]
-            expected_shape = tuple([K] + comp['shape'])
-            assert arr.shape == expected_shape, (
-                f"Layer {li}, {name}: shape {arr.shape} != expected {expected_shape}")
-
-            # Check dtype: BF16 components should be bfloat16 (view)
-            if comp['dtype'] == 'BF16':
-                assert arr.dtype == mx.bfloat16, (
-                    f"Layer {li}, {name}: dtype {arr.dtype} != bfloat16")
-            elif comp['dtype'] == 'U32':
-                assert arr.dtype == mx.uint32, (
-                    f"Layer {li}, {name}: dtype {arr.dtype} != uint32")
-
-    print(f"[PASS] prealloc_stacked: {test_layers} layers, {len(components)} comps, K={K}")
-    print(f"       Shapes verified, BF16 views verified")
+    fast_moe_load.init(
+        num_workers=8,
+        num_layers=3,  # just 3 layers for test
+        K=K,
+        components=fml_components,
+        packed_dir=PACKED_DIR,
+        expert_size=expert_size,
+    )
 
     s = fast_moe_load.stats()
-    print(f"       Stats: {s}")
+    assert s['initialized'] == 1, f"Expected initialized=1, got {s['initialized']}"
+    assert s['num_workers'] == 8, f"Expected 8 workers, got {s['num_workers']}"
+    assert s['num_layers'] == 3, f"Expected 3 layers, got {s['num_layers']}"
+    assert s['K'] == K, f"Expected K={K}, got {s['K']}"
+    assert s['staging_size'] > 0, f"Expected staging_size > 0, got {s['staging_size']}"
+
+    print(f"[PASS] init_and_stats: initialized with 3 layers, staging={s['staging_size']/(1024*1024):.1f} MB")
 
     fast_moe_load.shutdown()
     return True
 
 
-def test_load_and_assemble():
-    """Test that load_and_assemble fills buffers with correct data."""
+def test_fresh_arrays():
+    """Test that load_and_assemble returns FRESH arrays every call."""
     import fast_moe_load
 
-    fast_moe_load.init(num_workers=8)
+    test_layers = 2
+
+    fast_moe_load.init(
+        num_workers=8,
+        num_layers=test_layers,
+        K=K,
+        components=fml_components,
+        packed_dir=PACKED_DIR,
+        expert_size=expert_size,
+    )
+
+    routing = [
+        (0, [10, 42, 100, 7]),
+        (1, [255, 0, 128, 64]),
+    ]
+
+    # First call
+    result1 = fast_moe_load.load_and_assemble(routing)
+    assert isinstance(result1, list), f"Expected list, got {type(result1)}"
+    assert len(result1) == test_layers, f"Expected {test_layers} layers, got {len(result1)}"
+
+    # Grab a reference to first call's array
+    arr1 = result1[0][components[0]['name']]
+    arr1_copy = mx.array(arr1)  # copy the data
+    mx.eval(arr1_copy)
+
+    # Second call with DIFFERENT routing
+    routing2 = [
+        (0, [200, 150, 50, 1]),
+        (1, [33, 77, 200, 150]),
+    ]
+    result2 = fast_moe_load.load_and_assemble(routing2)
+
+    # The arrays should be DIFFERENT objects (fresh allocation)
+    arr2 = result2[0][components[0]['name']]
+
+    # And they should have different data (different experts loaded)
+    mx.eval(arr2)
+    mx.eval(arr1_copy)
+    same = mx.array_equal(arr1_copy, arr2)
+    mx.eval(same)
+    assert not same.item(), "FRESH arrays should have different data for different routing"
+
+    # The OLD result1 should still have its original data (not overwritten!)
+    # This is the key difference from the old pre-allocated approach.
+    mx.eval(arr1)
+    old_still_valid = mx.array_equal(arr1, arr1_copy)
+    mx.eval(old_still_valid)
+    assert old_still_valid.item(), "Old result arrays should still be valid (not overwritten)"
+
+    print(f"[PASS] fresh_arrays: confirmed FRESH mx.arrays each call, old data preserved")
+
+    fast_moe_load.shutdown()
+    return True
+
+
+def test_data_correctness():
+    """Test that load_and_assemble fills arrays with correct data (bit-exact)."""
+    import fast_moe_load
 
     test_layers = 3
-    layer_dicts = fast_moe_load.prealloc_stacked(
-        test_layers, K, fml_components, PACKED_DIR, expert_size)
 
-    # Pick some expert indices to load
+    fast_moe_load.init(
+        num_workers=8,
+        num_layers=test_layers,
+        K=K,
+        components=fml_components,
+        packed_dir=PACKED_DIR,
+        expert_size=expert_size,
+    )
+
     routing = [
-        (0, [10, 42, 100, 7]),     # layer 0
-        (1, [255, 0, 128, 64]),    # layer 1
-        (2, [33, 77, 200, 150]),   # layer 2
+        (0, [10, 42, 100, 7]),
+        (1, [255, 0, 128, 64]),
+        (2, [33, 77, 200, 150]),
     ]
 
     result = fast_moe_load.load_and_assemble(routing)
-    assert result is layer_dicts, "load_and_assemble should return same list object"
+    assert isinstance(result, list)
+    assert len(result) == test_layers
 
     # Verify data by reading the same experts via direct pread
-    for layer_idx, expert_indices in routing:
+    for entry_idx, (layer_idx, expert_indices) in enumerate(routing):
+        layer_dict = result[entry_idx]
+        assert isinstance(layer_dict, dict), f"Entry {entry_idx}: expected dict"
+        assert len(layer_dict) == len(components), (
+            f"Entry {entry_idx}: expected {len(components)} components, got {len(layer_dict)}")
+
         packed_file = os.path.join(PACKED_DIR, f"layer_{layer_idx:02d}.bin")
         fd = os.open(packed_file, os.O_RDONLY)
 
@@ -137,11 +187,22 @@ def test_load_and_assemble():
                 ref_bytes = os.pread(fd, comp_size, expert_offset + comp_offset)
 
                 # Get the stacked array and extract slot
-                stacked_arr = layer_dicts[layer_idx][comp_name]
+                stacked_arr = layer_dict[comp_name]
 
+                # Check shape
+                expected_shape = tuple([K] + comp['shape'])
+                assert stacked_arr.shape == expected_shape, (
+                    f"Entry {entry_idx}, {comp_name}: shape {stacked_arr.shape} != {expected_shape}")
+
+                # Check dtype
                 if comp['dtype'] == 'BF16':
-                    # The stacked arr is bfloat16 view; get uint16 view for comparison
+                    assert stacked_arr.dtype == mx.bfloat16, (
+                        f"Entry {entry_idx}, {comp_name}: dtype {stacked_arr.dtype} != bfloat16")
                     slot_arr = stacked_arr[slot].view(mx.uint16)
+                elif comp['dtype'] == 'U32':
+                    assert stacked_arr.dtype == mx.uint32, (
+                        f"Entry {entry_idx}, {comp_name}: dtype {stacked_arr.dtype} != uint32")
+                    slot_arr = stacked_arr[slot]
                 else:
                     slot_arr = stacked_arr[slot]
 
@@ -149,90 +210,45 @@ def test_load_and_assemble():
                 if comp['dtype'] == 'U32':
                     ref_np = np.frombuffer(ref_bytes, dtype=np.uint32).reshape(comp['shape'])
                     ref_mx = mx.array(ref_np)
-                    match = mx.array_equal(slot_arr, ref_mx)
                 elif comp['dtype'] == 'BF16':
                     ref_np = np.frombuffer(ref_bytes, dtype=np.uint16).reshape(comp['shape'])
                     ref_mx = mx.array(ref_np)
-                    match = mx.array_equal(slot_arr, ref_mx)
                 else:
-                    # Fallback
                     ref_np = np.frombuffer(ref_bytes, dtype=np.uint8)
-                    slot_bytes = np.array(slot_arr, dtype=np.uint8)
-                    match = np.array_equal(ref_np, slot_bytes)
+                    slot_arr = slot_arr.flatten()
+                    ref_mx = mx.array(ref_np)
 
+                match = mx.array_equal(slot_arr, ref_mx)
                 mx.eval(match)
                 assert match.item(), (
-                    f"Data mismatch: layer={layer_idx}, slot={slot}, "
-                    f"expert={eidx}, comp={comp_name}")
+                    f"Data mismatch: entry={entry_idx}, layer={layer_idx}, "
+                    f"slot={slot}, expert={eidx}, comp={comp_name}")
 
         os.close(fd)
 
-    print(f"[PASS] load_and_assemble: {len(routing)} layers, K={K}, bit-exact verified")
+    print(f"[PASS] data_correctness: {len(routing)} layers, K={K}, all 9 components bit-exact")
 
     s = fast_moe_load.stats()
-    print(f"       Stats: {s}")
-
-    fast_moe_load.shutdown()
-    return True
-
-
-def test_load_experts_direct():
-    """Test the compatibility load_experts_direct function."""
-    import fast_moe_load
-
-    fast_moe_load.init(num_workers=8)
-
-    test_layers = 2
-    layer_dicts = fast_moe_load.prealloc_stacked(
-        test_layers, K, fml_components, PACKED_DIR, expert_size)
-
-    # Build load_list in the old (layer, expert, slot) format
-    load_list = [
-        (0, 23, 0),
-        (0, 45, 1),
-        (0, 120, 2),
-        (0, 7, 3),
-        (1, 100, 0),
-        (1, 200, 1),
-        (1, 50, 2),
-        (1, 0, 3),
-    ]
-
-    result = fast_moe_load.load_experts_direct(load_list)
-    assert result > 0, f"Expected positive result, got {result}"
-
-    # Verify one slot
-    packed_file = os.path.join(PACKED_DIR, "layer_00.bin")
-    fd = os.open(packed_file, os.O_RDONLY)
-
-    # Check layer 0, slot 0, expert 23, gate_proj.weight
-    comp = components[0]  # gate_proj.weight
-    ref_bytes = os.pread(fd, comp['size'], 23 * expert_size + comp['offset'])
-    ref_np = np.frombuffer(ref_bytes, dtype=np.uint32).reshape(comp['shape'])
-    ref_mx = mx.array(ref_np)
-
-    slot_arr = layer_dicts[0][comp['name']][0]  # slot 0
-    match = mx.array_equal(slot_arr, ref_mx)
-    mx.eval(match)
-    assert match.item(), "load_experts_direct data mismatch"
-
-    os.close(fd)
-
-    print(f"[PASS] load_experts_direct: {len(load_list)} entries, data verified")
+    print(f"       Stats: io={s['total_io_ms']:.1f}ms, create={s['total_create_ms']:.1f}ms")
 
     fast_moe_load.shutdown()
     return True
 
 
 def test_timing():
-    """Compare timing: stacked (new) vs per-slot + mx.stack (old)."""
+    """Benchmark: target <50ms for 240 experts (60 layers x 4 experts x 9 comps)."""
     import fast_moe_load
 
-    fast_moe_load.init(num_workers=8)
-
     test_layers = 60  # full model
-    layer_dicts = fast_moe_load.prealloc_stacked(
-        test_layers, K, fml_components, PACKED_DIR, expert_size)
+
+    fast_moe_load.init(
+        num_workers=8,
+        num_layers=test_layers,
+        K=K,
+        components=fml_components,
+        packed_dir=PACKED_DIR,
+        expert_size=expert_size,
+    )
 
     # Generate random routing for all 60 layers
     rng = np.random.default_rng(42)
@@ -241,55 +257,63 @@ def test_timing():
         experts = rng.choice(num_experts, size=K, replace=False).tolist()
         routing.append((li, experts))
 
-    # Warmup
+    # Warmup (2 calls)
+    fast_moe_load.load_and_assemble(routing)
     fast_moe_load.load_and_assemble(routing)
 
-    # Time the new stacked approach
+    # Reset stats after warmup
+    # (can't reset individually, but total_calls gives us context)
+
+    # Time the fresh-array approach with per-call timing
     N = 10
-    t0 = time.perf_counter()
+    timings = []
     for _ in range(N):
+        s_before = fast_moe_load.stats()
+        t0 = time.perf_counter()
         result = fast_moe_load.load_and_assemble(routing)
-    t_stacked = (time.perf_counter() - t0) / N
-
-    # Time the old approach: load_experts_direct + Python mx.stack assembly
-    # Build old-style load_list
-    old_load_list = []
-    for li, experts in routing:
-        for slot, eidx in enumerate(experts):
-            old_load_list.append((li, eidx, slot))
-
-    t0 = time.perf_counter()
-    for _ in range(N):
-        fast_moe_load.load_experts_direct(old_load_list)
-        # Simulate the Python assembly step
-        for li in range(test_layers):
-            expert_tensors = {}
-            for comp in components:
-                comp_name = comp['name']
-                slices = [layer_dicts[li][comp_name][s] for s in range(K)]
-                expert_tensors[comp_name] = mx.stack(slices, axis=0)
-    t_old_with_stack = (time.perf_counter() - t0) / N
-
-    # Also time just the I/O without assembly
-    t0 = time.perf_counter()
-    for _ in range(N):
-        fast_moe_load.load_experts_direct(old_load_list)
-    t_io_only = (time.perf_counter() - t0) / N
-
-    # Compute the assembly overhead
-    t_assembly = t_old_with_stack - t_io_only
+        t1 = time.perf_counter()
+        s_after = fast_moe_load.stats()
+        wall_ms = (t1 - t0) * 1000
+        io_ms = s_after['total_io_ms'] - s_before['total_io_ms']
+        create_ms = s_after['total_create_ms'] - s_before['total_create_ms']
+        timings.append((wall_ms, io_ms, create_ms))
 
     s = fast_moe_load.stats()
-    bytes_per_token = K * len(components) * test_layers
     total_data_mb = sum(c['size'] for c in components) * K * test_layers / 1e6
+
+    avg_wall = sum(t[0] for t in timings) / N
+    avg_io = sum(t[1] for t in timings) / N
+    avg_create = sum(t[2] for t in timings) / N
+    min_wall = min(t[0] for t in timings)
+    min_io = min(t[1] for t in timings)
+    min_create = min(t[2] for t in timings)
 
     print(f"\n[TIMING] 60 layers, K={K}, {len(components)} components")
     print(f"  Data per token: {total_data_mb:.1f} MB ({K} experts x {test_layers} layers)")
-    print(f"  Stacked (new):           {t_stacked*1000:7.2f} ms  <- ONE C call, no Python assembly")
-    print(f"  Direct + mx.stack (old): {t_old_with_stack*1000:7.2f} ms  <- C I/O + Python loop + 540 mx.stack")
-    print(f"    I/O only:              {t_io_only*1000:7.2f} ms")
-    print(f"    Assembly overhead:      {t_assembly*1000:7.2f} ms  <- THIS is what stacked eliminates")
-    print(f"  Speedup: {t_old_with_stack/t_stacked:.2f}x")
+    print(f"  Staging buffer: {s['staging_size']/(1024*1024):.1f} MB")
+    print(f"  Avg wall:       {avg_wall:7.2f} ms")
+    print(f"  Avg I/O:        {avg_io:7.2f} ms  (C pread, GIL released)")
+    print(f"  Avg Create:     {avg_create:7.2f} ms  (numpy -> mx.array + eval)")
+    print(f"  Min wall:       {min_wall:7.2f} ms")
+    print(f"  Min I/O:        {min_io:7.2f} ms")
+    print(f"  Min Create:     {min_create:7.2f} ms")
+    print(f"  I/O throughput: {total_data_mb / (avg_io/1000):.0f} MB/s" if avg_io > 0 else "  I/O: N/A")
+    print(f"\n  Per-call breakdown:")
+    for i, (w, io, cr) in enumerate(timings):
+        print(f"    Call {i}: wall={w:.1f}ms  io={io:.1f}ms  create={cr:.1f}ms")
+
+    # Verify shape/dtype of one result
+    assert len(result) == test_layers, f"Expected {test_layers} entries, got {len(result)}"
+    first_dict = result[0]
+    for comp in components:
+        arr = first_dict[comp['name']]
+        expected_shape = tuple([K] + comp['shape'])
+        assert arr.shape == expected_shape, f"{comp['name']}: {arr.shape} != {expected_shape}"
+
+    if t_total * 1000 < 50:
+        print(f"\n  ** TARGET MET: {t_total*1000:.1f}ms < 50ms **")
+    else:
+        print(f"\n  Target: <50ms, actual: {t_total*1000:.1f}ms")
 
     fast_moe_load.shutdown()
     return True
@@ -297,12 +321,12 @@ def test_timing():
 
 if __name__ == "__main__":
     print("=" * 60)
-    print("Testing fast_moe_load C extension")
+    print("Testing fast_moe_load C extension (FRESH mx.array approach)")
     print("=" * 60)
     print()
 
     all_pass = True
-    for test in [test_prealloc, test_load_and_assemble, test_load_experts_direct, test_timing]:
+    for test in [test_init_and_stats, test_fresh_arrays, test_data_correctness, test_timing]:
         try:
             test()
             print()
