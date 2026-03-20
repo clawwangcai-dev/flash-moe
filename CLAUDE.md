@@ -109,7 +109,7 @@ MODEL_DIR="$HOME/.cache/huggingface/hub/models--mlx-community--Qwen3.5-397B-A17B
 在仓库根目录执行：
 
 ```bash
-cd /Volumes/SSD1T/projects/flash-moe
+cd ~/projects/flash-moe
 python3 make_expert_index.py \
   --model-dir "$MODEL_DIR" \
   --out expert_index.json
@@ -122,8 +122,8 @@ python3 make_expert_index.py \
 ### 3. 打包 4-bit experts
 
 ```bash
-cd /Volumes/SSD1T/projects/flash-moe
-python3 repack_experts.py --index /Volumes/SSD1T/projects/flash-moe/expert_index.json
+cd ~/projects/flash-moe
+python3 repack_experts.py --index ~/projects/flash-moe/expert_index.json
 ```
 
 输出目录：
@@ -143,7 +143,7 @@ $MODEL_DIR/packed_experts/
 2-bit 更快，但质量更差，不适合依赖稳定 JSON / tool calling 的场景。
 
 ```bash
-cd /Volumes/SSD1T/projects/flash-moe/metal_infer
+cd ~/projects/flash-moe/metal_infer
 python3 repack_experts_2bit.py
 ```
 
@@ -158,7 +158,7 @@ $MODEL_DIR/packed_experts_2bit/
 当前仓库不会自动从 Hugging Face snapshot 生成这些本地文件，需要显式执行。
 
 ```bash
-cd /Volumes/SSD1T/projects/flash-moe/metal_infer
+cd ~/projects/flash-moe/metal_infer
 python3 extract_weights.py --model "$MODEL_DIR" --output .
 python3 export_tokenizer.py "$MODEL_DIR/tokenizer.json" tokenizer.bin
 python3 export_vocab.py "$MODEL_DIR/tokenizer.json" vocab.bin
@@ -178,7 +178,7 @@ python3 export_vocab.py "$MODEL_DIR/tokenizer.json" vocab.bin
 ### 7. 编译推理程序
 
 ```bash
-cd /Volumes/SSD1T/projects/flash-moe/metal_infer
+cd ~/projects/flash-moe/metal_infer
 make infer
 ```
 
@@ -189,14 +189,14 @@ make infer
 默认示例：中文
 
 ```bash
-cd /Volumes/SSD1T/projects/flash-moe/metal_infer
+cd ~/projects/flash-moe/metal_infer
 ./infer --prompt "你好，做个自我介绍" --tokens 64
 ```
 
 切换为英文：
 
 ```bash
-cd /Volumes/SSD1T/projects/flash-moe/metal_infer
+cd ~/projects/flash-moe/metal_infer
 ./infer --prompt "Hi, introduce yourself briefly." --tokens 64
 ```
 
@@ -212,7 +212,7 @@ cd /Volumes/SSD1T/projects/flash-moe/metal_infer
 ### 9. 运行 2-bit 推理
 
 ```bash
-cd /Volumes/SSD1T/projects/flash-moe/metal_infer
+cd ~/projects/flash-moe/metal_infer
 ./infer --prompt "你好，做个自我介绍" --tokens 64 --2bit
 ```
 
@@ -234,14 +234,14 @@ cd /Volumes/SSD1T/projects/flash-moe/metal_infer
 先在一个终端启动服务：
 
 ```bash
-cd /Volumes/SSD1T/projects/flash-moe/metal_infer
+cd ~/projects/flash-moe/metal_infer
 ./infer --serve 8000
 ```
 
 再在另一个终端启动聊天：
 
 ```bash
-cd /Volumes/SSD1T/projects/flash-moe/metal_infer
+cd ~/projects/flash-moe/metal_infer
 make chat
 ./chat
 ```
@@ -423,7 +423,7 @@ MODEL_DIR="$HOME/.cache/huggingface/hub/models--mlx-community--Qwen3.5-397B-A17B
 ### 2. Build `expert_index.json`
 
 ```bash
-cd /Volumes/SSD1T/projects/flash-moe
+cd ~/projects/flash-moe
 python3 make_expert_index.py \
   --model-dir "$MODEL_DIR" \
   --out expert_index.json
@@ -436,8 +436,8 @@ Generate this file on the target machine. It stores the machine-local `model_pat
 ### 3. Pack 4-bit experts
 
 ```bash
-cd /Volumes/SSD1T/projects/flash-moe
-python3 repack_experts.py --index /Volumes/SSD1T/projects/flash-moe/expert_index.json
+cd ~/projects/flash-moe
+python3 repack_experts.py --index ~/projects/flash-moe/expert_index.json
 ```
 
 Output directory:
@@ -449,7 +449,7 @@ $MODEL_DIR/packed_experts/
 ### 4. Optional: build 2-bit experts
 
 ```bash
-cd /Volumes/SSD1T/projects/flash-moe/metal_infer
+cd ~/projects/flash-moe/metal_infer
 python3 repack_experts_2bit.py
 ```
 
@@ -464,7 +464,7 @@ $MODEL_DIR/packed_experts_2bit/
 The repo does not generate these files automatically from the Hugging Face snapshot. Run them explicitly:
 
 ```bash
-cd /Volumes/SSD1T/projects/flash-moe/metal_infer
+cd ~/projects/flash-moe/metal_infer
 python3 extract_weights.py --model "$MODEL_DIR" --output .
 python3 export_tokenizer.py "$MODEL_DIR/tokenizer.json" tokenizer.bin
 python3 export_vocab.py "$MODEL_DIR/tokenizer.json" vocab.bin
@@ -484,7 +484,7 @@ Required local files for `infer`:
 ### 7. Build `infer`
 
 ```bash
-cd /Volumes/SSD1T/projects/flash-moe/metal_infer
+cd ~/projects/flash-moe/metal_infer
 make infer
 ```
 
@@ -529,7 +529,7 @@ Expected signals:
 Start the server in one terminal:
 
 ```bash
-cd /Volumes/SSD1T/projects/flash-moe/metal_infer
+cd ~/projects/flash-moe/metal_infer
 ./infer --serve 8000
 ```
 

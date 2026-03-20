@@ -8,6 +8,7 @@ metal_infer/bench_pread
 *.metallib
 
 # Generated model files (recreate with scripts — see CLAUDE.md Quick Start)
+expert_index.json
 metal_infer/model_weights.bin
 metal_infer/model_weights.json
 metal_infer/vocab.bin
