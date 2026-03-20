@@ -68,21 +68,169 @@ On Apple Silicon, SSD DMA and GPU compute share the same memory controller and c
 
 ## Quick Start
 
+This is the shortest path that matches the code as it exists today and avoids the setup failures we hit during debugging.
+
+### 1. Model Snapshot
+
+Use a Hugging Face snapshot directory that contains:
+
+- `model.safetensors.index.json`
+- `model-00001-of-....safetensors`
+- `tokenizer.json`
+
+Example:
+
 ```bash
-cd metal_infer
-make
-# 4-bit inference (needs packed_experts/ directory)
-./infer --prompt "Explain quantum computing" --tokens 100
-
-# 2-bit inference (faster but breaks tool calling)
-./infer --prompt "Explain quantum computing" --tokens 100 --2bit
-
-# Interactive chat with tool calling
-./chat
-
-# Per-layer timing breakdown
-./infer --prompt "Hello" --tokens 20 --timing
+MODEL_DIR="/Volumes/SSD1T/projects/hf_cache/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit/snapshots/39159bd8aa74f5c8446d2b2dc584f62bb51cb0d3"
 ```
+
+### 2. Build the Expert Index
+
+Run this from the repo root:
+
+```bash
+cd /Volumes/SSD1T/projects/flash-moe
+python3 make_expert_index.py \
+  --model-dir "$MODEL_DIR" \
+  --out expert_index.json
+```
+
+This writes the model path into `expert_index.json`. Generate it on the target machine instead of copying it between machines.
+
+### 3. Pack 4-bit Experts
+
+```bash
+cd /Volumes/SSD1T/projects/flash-moe
+python3 repack_experts.py --index /Volumes/SSD1T/projects/flash-moe/expert_index.json
+```
+
+Success signal:
+
+```text
+[experts] 60/60 packed layer files available
+```
+
+The files are written under:
+
+```bash
+$MODEL_DIR/packed_experts/
+```
+
+### 4. Optional: Pack 2-bit Experts
+
+2-bit is faster, but quality is worse and tool calling / structured output is not reliable.
+
+```bash
+cd /Volumes/SSD1T/projects/flash-moe/metal_infer
+python3 repack_experts_2bit.py
+```
+
+This should create:
+
+```bash
+$MODEL_DIR/packed_experts_2bit/
+```
+
+### 5. Export `vocab.bin`
+
+`infer` needs `vocab.bin` for token display. The repo does not assume it already exists.
+
+```bash
+cd /Volumes/SSD1T/projects/flash-moe/metal_infer
+python3 export_vocab.py "$MODEL_DIR/tokenizer.json" vocab.bin
+```
+
+You should end up with:
+
+- `metal_infer/model_weights.bin`
+- `metal_infer/model_weights.json`
+- `metal_infer/tokenizer.bin`
+- `metal_infer/vocab.bin`
+
+### 6. Build the Inference Binary
+
+```bash
+cd /Volumes/SSD1T/projects/flash-moe/metal_infer
+make infer
+```
+
+### 7. Run 4-bit Inference
+
+4-bit is the recommended default.
+
+Default example: Chinese
+
+```bash
+cd /Volumes/SSD1T/projects/flash-moe/metal_infer
+./infer --prompt "你好，做个自我介绍" --tokens 64
+```
+
+English example:
+
+```bash
+cd /Volumes/SSD1T/projects/flash-moe/metal_infer
+./infer --prompt "Hi, introduce yourself briefly." --tokens 64
+```
+
+The binary now auto-loads `model_path` from `../expert_index.json`, so the command above is usually enough. If you want to force a path explicitly:
+
+```bash
+./infer \
+  --model "$MODEL_DIR" \
+  --prompt "你好，做个自我介绍" \
+  --tokens 64
+```
+
+### 8. Run 2-bit Inference
+
+```bash
+cd /Volumes/SSD1T/projects/flash-moe/metal_infer
+./infer --prompt "你好，做个自我介绍" --tokens 64 --2bit
+```
+
+English example:
+
+```bash
+./infer --prompt "Hi, introduce yourself briefly." --tokens 64 --2bit
+```
+
+Success signals:
+
+- `Quant:    2-bit experts`
+- `[experts] 60/60 packed layer files available`
+
+### 9. Interactive Chat
+
+```bash
+cd /Volumes/SSD1T/projects/flash-moe/metal_infer
+make chat
+./chat
+```
+
+### 10. Common Failures
+
+`zsh: no such file or directory: ./infer`
+
+- You are in the repo root, not `metal_infer/`.
+
+`ERROR: Cannot open vocab vocab.bin`
+
+- Run `python3 export_vocab.py "$MODEL_DIR/tokenizer.json" vocab.bin` in `metal_infer/`.
+
+`[experts] 0/60 packed layer files available`
+
+- `packed_experts/` was not generated, or `infer` is pointing at the wrong model directory.
+- Regenerate `expert_index.json` on this machine and verify it contains the correct `model_path`.
+
+`FileNotFoundError: 找不到 ... model.safetensors.index.json`
+
+- Your `--model-dir` path is wrong, or you accidentally split the path across lines inside the quotes.
+
+### 11. Performance / Quality Notes
+
+- 4-bit is the default production path.
+- 2-bit is mainly for speed experiments.
+- `--prompt` now uses the chat template path, so direct Chinese and English prompts work without manually adding `<|im_start|>` tags.
 
 ## Project Structure
 
