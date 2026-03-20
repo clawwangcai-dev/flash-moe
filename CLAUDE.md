@@ -75,7 +75,7 @@ CMD3(prev) → CMD1: attention projections + delta-net  [1.22ms GPU]
 示例：
 
 ```bash
-MODEL_DIR="/Volumes/SSD1T/projects/hf_cache/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit/snapshots/39159bd8aa74f5c8446d2b2dc584f62bb51cb0d3"
+MODEL_DIR="$HOME/.cache/huggingface/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit/snapshots/<your-snapshot-id>"
 ```
 
 ### 2. 生成 expert 索引
@@ -88,6 +88,8 @@ python3 make_expert_index.py \
   --model-dir "$MODEL_DIR" \
   --out expert_index.json
 ```
+
+其中 `<your-snapshot-id>` 只是示例占位符，需要替换成你本机实际的 snapshot 目录名。
 
 `expert_index.json` 会写入当前机器的实际 `model_path`，所以应在目标机器上现生成，不建议跨机器复制。
 
@@ -194,6 +196,17 @@ cd /Volumes/SSD1T/projects/flash-moe/metal_infer
 - `[experts] 60/60 packed layer files available`
 
 ### 9. 交互式聊天
+
+`./chat` 是一个本地客户端，不会自己启动推理服务。先开服务端，再开聊天界面。
+
+先在一个终端启动服务：
+
+```bash
+cd /Volumes/SSD1T/projects/flash-moe/metal_infer
+./infer --serve 8000
+```
+
+再在另一个终端启动聊天：
 
 ```bash
 cd /Volumes/SSD1T/projects/flash-moe/metal_infer
@@ -337,7 +350,7 @@ Use a Hugging Face snapshot directory containing:
 Example:
 
 ```bash
-MODEL_DIR="/Volumes/SSD1T/projects/hf_cache/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit/snapshots/39159bd8aa74f5c8446d2b2dc584f62bb51cb0d3"
+MODEL_DIR="$HOME/.cache/huggingface/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit/snapshots/<your-snapshot-id>"
 ```
 
 ### 2. Build `expert_index.json`
@@ -348,6 +361,8 @@ python3 make_expert_index.py \
   --model-dir "$MODEL_DIR" \
   --out expert_index.json
 ```
+
+`<your-snapshot-id>` is a placeholder. Replace it with the actual snapshot directory on your machine.
 
 Generate this file on the target machine. It stores the machine-local `model_path`.
 
@@ -434,6 +449,17 @@ Expected signals:
 
 ### 9. Interactive chat
 
+`./chat` is only a local client. It does not start the inference server for you.
+
+Start the server in one terminal:
+
+```bash
+cd /Volumes/SSD1T/projects/flash-moe/metal_infer
+./infer --serve 8000
+```
+
+Then start the chat client in another terminal:
+
 ```bash
 make chat
 ./chat
@@ -466,4 +492,3 @@ python3 export_vocab.py "$MODEL_DIR/tokenizer.json" vocab.bin
 - 4-bit is the production default.
 - 2-bit is mainly for speed experiments.
 - `--prompt` now goes through the chat-template path, so both Chinese and English prompts work directly.
-
