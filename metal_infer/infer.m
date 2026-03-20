@@ -136,6 +136,42 @@ static double now_ms(void) {
     return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
 }
 
+static const char *resolve_default_model_path(char *buf, size_t buf_size) {
+    const char *env = getenv("FLASH_MOE_MODEL_PATH");
+    if (env && env[0] != '\0') {
+        return env;
+    }
+
+    const char *index_candidates[] = {
+        "../expert_index.json",
+        "expert_index.json",
+        NULL
+    };
+
+    for (int i = 0; index_candidates[i]; i++) {
+        @autoreleasepool {
+            NSString *path = [NSString stringWithUTF8String:index_candidates[i]];
+            NSData *data = [NSData dataWithContentsOfFile:path];
+            if (!data) continue;
+
+            NSError *error = nil;
+            id obj = [NSJSONSerialization JSONObjectWithData:data options:0 error:&error];
+            if (![obj isKindOfClass:[NSDictionary class]]) continue;
+
+            id model_path = [(NSDictionary *)obj objectForKey:@"model_path"];
+            if (![model_path isKindOfClass:[NSString class]]) continue;
+
+            const char *utf8 = [(NSString *)model_path UTF8String];
+            if (!utf8 || utf8[0] == '\0') continue;
+
+            snprintf(buf, buf_size, "%s", utf8);
+            return buf;
+        }
+    }
+
+    return MODEL_PATH_DEFAULT;
+}
+
 // ============================================================================
 // Per-phase timing accumulators for fused_layer_forward
 // Tracks time spent in each pipeline phase across all layers per token.
@@ -578,6 +614,42 @@ typedef struct {
     int num_tokens;
 } Vocabulary;
 
+static int utf8_next_codepoint(const char *s, int len, int *pos, uint32_t *cp_out) {
+    if (*pos >= len) return 0;
+
+    const unsigned char *p = (const unsigned char *)s;
+    unsigned char c0 = p[*pos];
+    if (c0 < 0x80) {
+        *cp_out = c0;
+        (*pos)++;
+        return 1;
+    }
+    if ((c0 & 0xE0) == 0xC0 && *pos + 1 < len) {
+        *cp_out = ((uint32_t)(c0 & 0x1F) << 6) | (uint32_t)(p[*pos + 1] & 0x3F);
+        *pos += 2;
+        return 1;
+    }
+    if ((c0 & 0xF0) == 0xE0 && *pos + 2 < len) {
+        *cp_out = ((uint32_t)(c0 & 0x0F) << 12) |
+                  ((uint32_t)(p[*pos + 1] & 0x3F) << 6) |
+                  (uint32_t)(p[*pos + 2] & 0x3F);
+        *pos += 3;
+        return 1;
+    }
+    if ((c0 & 0xF8) == 0xF0 && *pos + 3 < len) {
+        *cp_out = ((uint32_t)(c0 & 0x07) << 18) |
+                  ((uint32_t)(p[*pos + 1] & 0x3F) << 12) |
+                  ((uint32_t)(p[*pos + 2] & 0x3F) << 6) |
+                  (uint32_t)(p[*pos + 3] & 0x3F);
+        *pos += 4;
+        return 1;
+    }
+
+    *cp_out = c0;
+    (*pos)++;
+    return 1;
+}
+
 static Vocabulary *load_vocab(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) {
@@ -610,12 +682,7 @@ static Vocabulary *load_vocab(const char *path) {
     return v;
 }
 
-static const char *decode_token(Vocabulary *v, int token_id) {
-    if (token_id < 0 || token_id >= v->num_tokens || !v->tokens[token_id]) {
-        return "<unk>";
-    }
-    return v->tokens[token_id];
-}
+static const char *decode_token(Vocabulary *v, int token_id);
 
 // ============================================================================
 // Prompt tokens loader
@@ -663,6 +730,48 @@ static void init_tokenizer(void) {
         }
     }
     fprintf(stderr, "WARNING: tokenizer.bin not found, tokenization will fail\n");
+}
+
+static const char *decode_token(Vocabulary *v, int token_id) {
+    static char decoded[8192];
+    if (token_id < 0 || token_id >= v->num_tokens || !v->tokens[token_id]) {
+        return "<unk>";
+    }
+
+    init_tokenizer();
+    if (!g_tokenizer_loaded) {
+        return v->tokens[token_id];
+    }
+
+    const char *piece = v->tokens[token_id];
+    int piece_len = v->lengths[token_id];
+    int in_pos = 0;
+    int out_pos = 0;
+
+    while (in_pos < piece_len && out_pos < (int)sizeof(decoded) - 1) {
+        uint32_t cp = 0;
+        if (!utf8_next_codepoint(piece, piece_len, &in_pos, &cp)) break;
+
+        if (cp < 512) {
+            decoded[out_pos++] = (char)g_tokenizer.char_byte[cp];
+        } else {
+            int emit_pos = out_pos;
+            if (cp < 0x800 && emit_pos + 2 < (int)sizeof(decoded) - 1) {
+                decoded[emit_pos++] = (char)(0xC0 | (cp >> 6));
+                decoded[emit_pos++] = (char)(0x80 | (cp & 0x3F));
+            } else if (emit_pos + 3 < (int)sizeof(decoded) - 1) {
+                decoded[emit_pos++] = (char)(0xE0 | (cp >> 12));
+                decoded[emit_pos++] = (char)(0x80 | ((cp >> 6) & 0x3F));
+                decoded[emit_pos++] = (char)(0x80 | (cp & 0x3F));
+            } else {
+                break;
+            }
+            out_pos = emit_pos;
+        }
+    }
+
+    decoded[out_pos] = '\0';
+    return decoded;
 }
 
 static PromptTokens *encode_prompt_text_to_tokens(const char *text) {
@@ -6523,7 +6632,8 @@ static void print_usage(const char *prog) {
 
 int main(int argc, char **argv) {
     @autoreleasepool {
-        const char *model_path = MODEL_PATH_DEFAULT;
+        char default_model_path[1024];
+        const char *model_path = resolve_default_model_path(default_model_path, sizeof(default_model_path));
         const char *weights_path = NULL;
         const char *manifest_path = NULL;
         const char *vocab_path = NULL;
@@ -6690,9 +6800,9 @@ int main(int argc, char **argv) {
         PromptTokens *pt = NULL;
         if (serve_port == 0) {
             if (prompt_text) {
-                pt = encode_prompt_text_to_tokens(prompt_text);
+                pt = tokenize_chat_message(prompt_text);
                 if (!pt) {
-                    fprintf(stderr, "ERROR: Failed to encode prompt. Make sure encode_prompt.py exists.\n");
+                    fprintf(stderr, "ERROR: Failed to encode chat prompt from --prompt text\n");
                     return 1;
                 }
             } else if (!prompt_tokens_path) {
