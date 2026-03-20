@@ -64,6 +64,32 @@ CMD3(prev) → CMD1: attention projections + delta-net  [1.22ms GPU]
 
 下面这套步骤对应当前仓库实际代码路径，按顺序执行可以尽量避免我们这次调试里踩过的坑。
 
+### 0. 首次环境准备
+
+如果是第一次在新机器上跑，建议先完成下面这些步骤：
+
+```bash
+# 1) Xcode Command Line Tools
+xcode-select --install
+
+# 2) Python 依赖 + Hugging Face CLI
+python3 -m pip install -U numpy "huggingface_hub[cli]"
+
+# 3) 拉代码并编译
+git clone https://github.com/clawwangcai-dev/flash-moe.git
+cd flash-moe/metal_infer
+make
+cd ..
+
+# 4) 登录 Hugging Face（如果模型需要鉴权）
+hf auth login
+
+# 5) 下载模型到 Hugging Face 缓存
+hf download mlx-community/Qwen3.5-397B-A17B-4bit
+```
+
+上面第 5 步默认会把模型放到 `$HOME/.cache/huggingface/hub/...`，后面的 `MODEL_DIR` 变量通常就指向这里。
+
 ### 1. 准备模型快照目录
 
 使用 Hugging Face snapshot 目录，至少包含：
@@ -127,14 +153,20 @@ python3 repack_experts_2bit.py
 $MODEL_DIR/packed_experts_2bit/
 ```
 
-### 5. 导出 `vocab.bin`
+### 5. 导出非 expert 权重和 tokenizer
 
-`infer` 显示 token 时需要 `vocab.bin`。当前仓库不假设它一定已经存在。
+当前仓库不会自动从 Hugging Face snapshot 生成这些本地文件，需要显式执行。
 
 ```bash
 cd /Volumes/SSD1T/projects/flash-moe/metal_infer
+python3 extract_weights.py --model "$MODEL_DIR" --output .
+python3 export_tokenizer.py "$MODEL_DIR/tokenizer.json" tokenizer.bin
 python3 export_vocab.py "$MODEL_DIR/tokenizer.json" vocab.bin
 ```
+
+注意：这些脚本里保留了作者机器上的默认 snapshot 路径，所以实际使用时建议始终显式传入 `"$MODEL_DIR"`。
+
+### 6. 检查本地推理文件
 
 运行前请确认这些文件都在：
 
@@ -143,14 +175,14 @@ python3 export_vocab.py "$MODEL_DIR/tokenizer.json" vocab.bin
 - `metal_infer/tokenizer.bin`
 - `metal_infer/vocab.bin`
 
-### 6. 编译推理程序
+### 7. 编译推理程序
 
 ```bash
 cd /Volumes/SSD1T/projects/flash-moe/metal_infer
 make infer
 ```
 
-### 7. 运行 4-bit 推理
+### 8. 运行 4-bit 推理
 
 4-bit 是推荐默认配置。
 
@@ -177,7 +209,7 @@ cd /Volumes/SSD1T/projects/flash-moe/metal_infer
   --tokens 64
 ```
 
-### 8. 运行 2-bit 推理
+### 9. 运行 2-bit 推理
 
 ```bash
 cd /Volumes/SSD1T/projects/flash-moe/metal_infer
@@ -195,7 +227,7 @@ cd /Volumes/SSD1T/projects/flash-moe/metal_infer
 - `Quant:    2-bit experts`
 - `[experts] 60/60 packed layer files available`
 
-### 9. 交互式聊天
+### 10. 交互式聊天
 
 `./chat` 是一个本地客户端，不会自己启动推理服务。先开服务端，再开聊天界面。
 
@@ -225,7 +257,16 @@ make chat
 - 在 `metal_infer/` 目录执行：
 
 ```bash
+python3 export_tokenizer.py "$MODEL_DIR/tokenizer.json" tokenizer.bin
 python3 export_vocab.py "$MODEL_DIR/tokenizer.json" vocab.bin
+```
+
+`ERROR: Failed to load weights`
+
+- 先执行：
+
+```bash
+python3 extract_weights.py --model "$MODEL_DIR" --output .
 ```
 
 `[experts] 0/60 packed layer files available`
@@ -339,6 +380,32 @@ Flash-MoE is a pure C / Metal inference engine for **Qwen3.5-397B-A17B**, design
 
 This is the shortest setup path that matches the codebase as it exists today.
 
+### 0. First-time setup
+
+On a new machine, this is the recommended path:
+
+```bash
+# 1) Xcode Command Line Tools
+xcode-select --install
+
+# 2) Python dependencies + Hugging Face CLI
+python3 -m pip install -U numpy "huggingface_hub[cli]"
+
+# 3) Clone and build
+git clone https://github.com/clawwangcai-dev/flash-moe.git
+cd flash-moe/metal_infer
+make
+cd ..
+
+# 4) Login to Hugging Face if the model requires auth
+hf auth login
+
+# 5) Download the model into the Hugging Face cache
+hf download mlx-community/Qwen3.5-397B-A17B-4bit
+```
+
+Step 5 usually puts the model under `$HOME/.cache/huggingface/hub/...`, which is what `MODEL_DIR` will point to below.
+
 ### 1. Prepare the model snapshot
 
 Use a Hugging Face snapshot directory containing:
@@ -392,12 +459,20 @@ Output directory:
 $MODEL_DIR/packed_experts_2bit/
 ```
 
-### 5. Export `vocab.bin`
+### 5. Export non-expert weights and tokenizer files
+
+The repo does not generate these files automatically from the Hugging Face snapshot. Run them explicitly:
 
 ```bash
 cd /Volumes/SSD1T/projects/flash-moe/metal_infer
+python3 extract_weights.py --model "$MODEL_DIR" --output .
+python3 export_tokenizer.py "$MODEL_DIR/tokenizer.json" tokenizer.bin
 python3 export_vocab.py "$MODEL_DIR/tokenizer.json" vocab.bin
 ```
+
+These scripts still contain author-local default paths, so in practice you should always pass `"$MODEL_DIR"` explicitly.
+
+### 6. Verify local inference assets
 
 Required local files for `infer`:
 
@@ -406,14 +481,14 @@ Required local files for `infer`:
 - `metal_infer/tokenizer.bin`
 - `metal_infer/vocab.bin`
 
-### 6. Build `infer`
+### 7. Build `infer`
 
 ```bash
 cd /Volumes/SSD1T/projects/flash-moe/metal_infer
 make infer
 ```
 
-### 7. Run 4-bit inference
+### 8. Run 4-bit inference
 
 Default example: Chinese
 
@@ -436,7 +511,7 @@ If you want to force the model path explicitly:
   --tokens 64
 ```
 
-### 8. Run 2-bit inference
+### 9. Run 2-bit inference
 
 ```bash
 ./infer --prompt "Hi, introduce yourself briefly." --tokens 64 --2bit
@@ -447,7 +522,7 @@ Expected signals:
 - `Quant:    2-bit experts`
 - `[experts] 60/60 packed layer files available`
 
-### 9. Interactive chat
+### 10. Interactive chat
 
 `./chat` is only a local client. It does not start the inference server for you.
 
@@ -476,7 +551,16 @@ make chat
 - Run:
 
 ```bash
+python3 export_tokenizer.py "$MODEL_DIR/tokenizer.json" tokenizer.bin
 python3 export_vocab.py "$MODEL_DIR/tokenizer.json" vocab.bin
+```
+
+`ERROR: Failed to load weights`
+
+- Run:
+
+```bash
+python3 extract_weights.py --model "$MODEL_DIR" --output .
 ```
 
 `[experts] 0/60 packed layer files available`
