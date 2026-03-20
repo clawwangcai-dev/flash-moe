@@ -1,92 +1,86 @@
-# Flash-MoE: Running a 397B Parameter Model on a Laptop
+<a id="zh-cn"></a>
 
-> **[Read the paper](paper/flash_moe.pdf)** — Full technical details, 90+ experiments, and the story of how an AI and a human built this in 24 hours.
+# Flash-MoE：在笔记本上运行 397B 参数模型
 
-Pure C/Metal inference engine that runs **Qwen3.5-397B-A17B** (a 397 billion parameter Mixture-of-Experts model) on a MacBook Pro with 48GB RAM at **4.4+ tokens/second** with production-quality output including tool calling.
+[![中文](https://img.shields.io/badge/中文-默认-black)](#zh-cn)
+[![English](https://img.shields.io/badge/English-Switch-blue)](#en)
 
-The entire 209GB model streams from SSD through a custom Metal compute pipeline. No Python. No frameworks. Just C, Objective-C, and hand-tuned Metal shaders.
+> **[阅读论文](paper/flash_moe.pdf)**：完整技术细节、90+ 次实验，以及这套系统在 24 小时内由人类与 AI 协作完成的全过程。
 
-## Results
+这是一个纯 C / Metal 推理引擎，可以在 48GB 内存的 MacBook Pro 上运行 **Qwen3.5-397B-A17B**（397B 参数 MoE 模型），并达到 **4.4+ tokens/s** 的实际速度，同时支持较高质量输出与工具调用。
+
+整个 209GB 模型通过自定义 Metal 计算管线从 SSD 流式读取。没有 Python 推理框架，没有重量级运行时，只有 C、Objective-C 和手写 Metal kernel。
+
+## 结果
 
 ![Progress](progress.png)
 
-| Configuration | tok/s | Quality | Notes |
-|--------------|-------|---------|-------|
-| 4-bit experts, FMA kernel | **4.36** | Excellent | Current best. Full tool calling. 209GB on disk. |
-| 4-bit experts, baseline | 3.90 | Excellent | Before FMA kernel optimization. |
-| 2-bit experts, trust OS | 5.74 | Good* | 120GB on disk. *Breaks JSON/tool calling. |
-| 2-bit peak single token | 7.05 | Good* | Warm cache burst. *Not suitable for tool use. |
+| 配置 | tok/s | 质量 | 说明 |
+|---|---:|---|---|
+| 4-bit experts, FMA kernel | **4.36** | Excellent | 当前最佳方案，可用于工具调用，磁盘占用 209GB |
+| 4-bit experts, baseline | 3.90 | Excellent | FMA 优化前 |
+| 2-bit experts, trust OS | 5.74 | Good* | 磁盘占用 120GB，结构化输出不稳定 |
+| 2-bit peak single token | 7.05 | Good* | 热缓存峰值，不适合工具调用 |
 
-*2-bit quantization produces `\name\` instead of `"name"` in JSON output, making tool calling unreliable. 4-bit is the production configuration.
+\* 2-bit 量化会破坏 JSON / tool calling 的稳定性，例如把 `"` 变成错误字符。生产默认应使用 4-bit。
 
-## Hardware
+## 硬件
 
-- **Machine**: MacBook Pro, Apple M3 Max
-- **Chip**: 16-core CPU (12P + 4E), 40-core GPU, 16-core ANE
-- **Memory**: 48 GB unified (~400 GB/s bandwidth)
-- **SSD**: 1TB Apple Fabric, **17.5 GB/s sequential read** (measured)
-- **macOS**: 26.2 (Darwin 25.2.0)
+- **机器**：MacBook Pro
+- **芯片**：Apple M3 Max / M4 Pro 同类 Apple Silicon 均可参考
+- **内存**：48 GB unified memory
+- **SSD**：高顺序读带宽 NVMe
+- **系统**：现代 macOS
 
-## Architecture
+## 架构概览
 
-The model has 60 transformer layers: 45 GatedDeltaNet (linear attention) + 15 standard full attention. Each layer has 512 experts, of which K=4 are activated per token (plus one shared expert). Hidden dimension is 4096.
+模型共有 60 个 Transformer 层：45 层 GatedDeltaNet 线性注意力 + 15 层标准全注意力。每层有 512 个 experts，每个 token 激活其中 K=4 个，同时还有 1 个 shared expert。隐藏维度为 4096。
 
-### Key Techniques
+### 关键技术
 
-1. **SSD Expert Streaming** — Expert weights (209GB at 4-bit) are read from NVMe SSD on demand via parallel `pread()` with GCD dispatch groups. Only the K=4 active experts per layer are loaded (~6.75MB each). The OS page cache manages caching — no custom cache needed ("Trust the OS" principle). Inspired by Apple's "LLM in a Flash" paper.
+1. **SSD Expert Streaming**：209GB 的 expert 权重不常驻内存，而是按 token 通过 `pread()` 从 SSD 读取，仅加载当前激活的 K=4 个 experts。
+2. **FMA 优化反量化 kernel**：将 `(nibble * scale + bias) * x` 改写为 `fma(nibble, scale*x, bias*x)`，更好利用 GPU FMA 单元。
+3. **Metal Compute Shaders**：手写 4-bit / 2-bit matvec、SwiGLU、RMSNorm、RoPE、attention 与 MoE 融合 kernel。
+4. **Deferred GPU Expert Compute**：expert 前向延迟提交，让 CPU 在 GPU 工作时准备下一层。
+5. **Accelerate BLAS**：GatedDeltaNet 的线性注意力递推使用 `cblas_*` 系列。
+6. **Trust the OS**：不做自定义 expert cache，直接利用 macOS page cache。
 
-2. **FMA-Optimized Dequant Kernel** — The inner loop of the 4-bit dequantized matrix-vector multiply rearranges the math from `(nibble * scale + bias) * x` to `fma(nibble, scale*x, bias*x)`. Pre-computing `scale*x` and `bias*x` lets the GPU fused multiply-add unit do dequant+multiply in one instruction. 12% faster than the naive formulation.
+### 每层流水线（4-bit 平均约 4.28ms）
 
-3. **Metal Compute Shaders** — Hand-written Metal kernels for:
-   - 4-bit and 2-bit dequantized matrix-vector multiply (tiled, SIMD-reduced, shared input cache, FMA-optimized)
-   - Fused SwiGLU activation
-   - RMS normalization (two-pass: sum-of-squares reduction + apply)
-   - Batched GPU attention (Q@K^T, softmax, scores@V) for full attention layers
-   - GPU RoPE (fused with Q deinterleave and K normalization)
-   - MoE combine + residual + sigmoid gate (fused kernel)
-
-4. **Deferred GPU Expert Compute** — CMD3 (expert forward pass) is submitted without waiting. The GPU executes it while the CPU prepares the next layer. The combine + residual + norm are also on GPU, feeding directly into the next layer's attention projections.
-
-5. **Accelerate BLAS for Linear Attention** — The GatedDeltaNet recurrence uses `cblas_sscal`, `cblas_sgemv`, and `cblas_sger` for the 64-head × 128×128 state matrix update. 64% faster than scalar code.
-
-6. **Trust the OS** — No custom expert cache. The OS page cache (~35GB) manages expert data caching via standard LRU. Every custom caching approach we tested (Metal LRU, malloc cache, LZ4 compressed cache) was slower due to GPU memory pressure or overhead. The page cache achieves ~71% hit rate naturally.
-
-### Pipeline Per Layer (4.28ms average at 4-bit)
-
-```
+```text
 CMD3(prev) → CMD1: attention projections + delta-net  [1.22ms GPU]
            → CPU: flush results                       [0.01ms CPU]
-           → CMD2: o_proj + norm + routing + shared    [0.55ms GPU]
-           → CPU: softmax + topK routing               [0.003ms]
-           → I/O: parallel pread K=4 experts           [2.41ms SSD]
-           → CMD3: expert forward + combine + norm     [0.04ms encode, DEFERRED]
+           → CMD2: o_proj + norm + routing + shared   [0.55ms GPU]
+           → CPU: softmax + topK routing              [0.003ms]
+           → I/O: parallel pread K=4 experts          [2.41ms SSD]
+           → CMD3: expert forward + combine + norm    [0.04ms encode, DEFERRED]
 ```
 
-### Unified Memory Constraint
+### Unified Memory 约束
 
-On Apple Silicon, SSD DMA and GPU compute share the same memory controller and cannot be profitably overlapped. The GPU's dequant kernels are bandwidth-saturated at ~418 GiB/s. Even small background SSD DMA causes disproportionate GPU latency spikes through memory controller arbitration. The serial pipeline (GPU → SSD → GPU) is hardware-optimal.
+在 Apple Silicon 上，SSD DMA 和 GPU 计算共用内存控制器，难以获得理想重叠。背景 SSD 读经常会明显拖慢 GPU，因此最终最优设计是串行的 `GPU -> SSD -> GPU` 管线。
 
-## Quick Start
+## 快速开始
 
-This is the shortest path that matches the code as it exists today and avoids the setup failures we hit during debugging.
+下面这套步骤对应当前仓库实际代码路径，按顺序执行可以尽量避免我们这次调试里踩过的坑。
 
-### 1. Model Snapshot
+### 1. 准备模型快照目录
 
-Use a Hugging Face snapshot directory that contains:
+使用 Hugging Face snapshot 目录，至少包含：
 
 - `model.safetensors.index.json`
 - `model-00001-of-....safetensors`
 - `tokenizer.json`
 
-Example:
+示例：
 
 ```bash
 MODEL_DIR="/Volumes/SSD1T/projects/hf_cache/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit/snapshots/39159bd8aa74f5c8446d2b2dc584f62bb51cb0d3"
 ```
 
-### 2. Build the Expert Index
+### 2. 生成 expert 索引
 
-Run this from the repo root:
+在仓库根目录执行：
 
 ```bash
 cd /Volumes/SSD1T/projects/flash-moe
@@ -95,84 +89,84 @@ python3 make_expert_index.py \
   --out expert_index.json
 ```
 
-This writes the model path into `expert_index.json`. Generate it on the target machine instead of copying it between machines.
+`expert_index.json` 会写入当前机器的实际 `model_path`，所以应在目标机器上现生成，不建议跨机器复制。
 
-### 3. Pack 4-bit Experts
+### 3. 打包 4-bit experts
 
 ```bash
 cd /Volumes/SSD1T/projects/flash-moe
 python3 repack_experts.py --index /Volumes/SSD1T/projects/flash-moe/expert_index.json
 ```
 
-Success signal:
-
-```text
-[experts] 60/60 packed layer files available
-```
-
-The files are written under:
+输出目录：
 
 ```bash
 $MODEL_DIR/packed_experts/
 ```
 
-### 4. Optional: Pack 2-bit Experts
+成功信号：
 
-2-bit is faster, but quality is worse and tool calling / structured output is not reliable.
+```text
+[experts] 60/60 packed layer files available
+```
+
+### 4. 可选：生成 2-bit experts
+
+2-bit 更快，但质量更差，不适合依赖稳定 JSON / tool calling 的场景。
 
 ```bash
 cd /Volumes/SSD1T/projects/flash-moe/metal_infer
 python3 repack_experts_2bit.py
 ```
 
-This should create:
+输出目录：
 
 ```bash
 $MODEL_DIR/packed_experts_2bit/
 ```
 
-### 5. Export `vocab.bin`
+### 5. 导出 `vocab.bin`
 
-`infer` needs `vocab.bin` for token display. The repo does not assume it already exists.
+`infer` 显示 token 时需要 `vocab.bin`。当前仓库不假设它一定已经存在。
 
 ```bash
 cd /Volumes/SSD1T/projects/flash-moe/metal_infer
 python3 export_vocab.py "$MODEL_DIR/tokenizer.json" vocab.bin
 ```
 
-You should end up with:
+运行前请确认这些文件都在：
 
 - `metal_infer/model_weights.bin`
 - `metal_infer/model_weights.json`
 - `metal_infer/tokenizer.bin`
 - `metal_infer/vocab.bin`
 
-### 6. Build the Inference Binary
+### 6. 编译推理程序
 
 ```bash
 cd /Volumes/SSD1T/projects/flash-moe/metal_infer
 make infer
 ```
 
-### 7. Run 4-bit Inference
+### 7. 运行 4-bit 推理
 
-4-bit is the recommended default.
+4-bit 是推荐默认配置。
 
-Default example: Chinese
+默认示例：中文
 
 ```bash
 cd /Volumes/SSD1T/projects/flash-moe/metal_infer
 ./infer --prompt "你好，做个自我介绍" --tokens 64
 ```
 
-English example:
+切换为英文：
 
 ```bash
 cd /Volumes/SSD1T/projects/flash-moe/metal_infer
 ./infer --prompt "Hi, introduce yourself briefly." --tokens 64
 ```
 
-The binary now auto-loads `model_path` from `../expert_index.json`, so the command above is usually enough. If you want to force a path explicitly:
+程序现在会优先从 `../expert_index.json` 自动读取 `model_path`。如果你想强制指定模型目录：
 
 ```bash
 ./infer \
@@ -181,25 +175,25 @@ The binary now auto-loads `model_path` from `../expert_index.json`, so the comma
   --tokens 64
 ```
 
-### 8. Run 2-bit Inference
+### 8. 运行 2-bit 推理
 
 ```bash
 cd /Volumes/SSD1T/projects/flash-moe/metal_infer
 ./infer --prompt "你好，做个自我介绍" --tokens 64 --2bit
 ```
 
-English example:
+英文示例：
 
 ```bash
 ./infer --prompt "Hi, introduce yourself briefly." --tokens 64 --2bit
 ```
 
-Success signals:
+成功信号：
 
 - `Quant:    2-bit experts`
 - `[experts] 60/60 packed layer files available`
 
-### 9. Interactive Chat
+### 9. 交互式聊天
 
 ```bash
 cd /Volumes/SSD1T/projects/flash-moe/metal_infer
@@ -207,7 +201,245 @@ make chat
 ./chat
 ```
 
-### 10. Common Failures
+## 常见问题
+
+`zsh: no such file or directory: ./infer`
+
+- 说明你当前在仓库根目录，不在 `metal_infer/` 目录下。
+
+`ERROR: Cannot open vocab vocab.bin`
+
+- 在 `metal_infer/` 目录执行：
+
+```bash
+python3 export_vocab.py "$MODEL_DIR/tokenizer.json" vocab.bin
+```
+
+`[experts] 0/60 packed layer files available`
+
+- `packed_experts/` 没生成，或者 `infer` 指向了错误的模型目录。
+- 重新在本机生成 `expert_index.json`，确认其中 `model_path` 正确。
+
+`FileNotFoundError: 找不到 ... model.safetensors.index.json`
+
+- `--model-dir` 路径写错了。
+- 或者你把路径在引号内部错误换行了。
+
+## 性能 / 质量说明
+
+- 4-bit 是默认生产路径。
+- 2-bit 主要用于速度实验。
+- `--prompt` 现在走 chat template，因此中英文 prompt 都可以直接输入，无需手动拼 `<|im_start|>` 标签。
+
+## 项目结构
+
+```text
+metal_infer/
+  infer.m                # 完整推理引擎
+  shaders.metal          # Metal compute kernels
+  chat.m                 # 交互式聊天 TUI
+  tokenizer.h            # 单头文件 BPE tokenizer
+  main.m                 # MoE benchmark
+  Makefile               # 构建脚本
+  extract_weights.py     # 导出非-expert 权重
+  repack_experts_2bit.py # 4-bit -> 2-bit expert 重打包
+  train_predictor.py     # expert routing 分析
+  model_weights.bin      # 非-expert 权重
+  model_weights.json     # manifest
+  vocab.bin              # token 显示用词表
+  tokenizer.bin          # BPE tokenizer 导出结果
+
+repack_experts.py        # 4-bit expert 打包脚本
+progress.py              # 结果可视化
+results.tsv              # 实验记录
+```
+
+## 做过什么尝试，哪些有效
+
+### 保留下来的方案
+
+| 方案 | 结果 | 影响 |
+|---|---|---|
+| FMA dequant kernel | GPU 计算时间 -12% | **+12% tok/s** |
+| Trust OS page cache | 删掉 Metal LRU 后反而 +38% | **基础性优化** |
+| GPU combine + norm in CMD3 | 避免 CPU 往返 | **流水线优化** |
+| BLAS delta-net | cpu_attn 0.78ms -> 0.28ms | **+64% attn** |
+| F_NOCACHE for 2-bit | +3% | **2-bit only** |
+| GPU fused attention (RoPE) | +2% | **小幅提升** |
+| C BPE tokenizer | 启动 180ms vs 3500ms | **20x 启动优化** |
+| Deferred CMD3 | GPU / CPU overlap | **流水线优化** |
+
+### 放弃的方案（58 次实验中的代表）
+
+| 方案 | 结果 | 原因 |
+|---|---|---|
+| LZ4 expert compression | -13% | 解压开销大于收益 |
+| F_RDADVISE prefetch | 净收益 0% | SSD DMA 会拖慢 GPU |
+| Temporal expert prediction | -18% | 命中率太低 |
+| MLP routing predictor | 31% accuracy | 不如简单基线 |
+| GPU LUT dequant kernel | -2% | 间接访问导致串行化 |
+| GPU private buffer compression | -20% | blit 开销过大 |
+| Spin-poll GPU wait | -23% | CPU 发热影响 GPU |
+| Expert file clustering | 0% | NVMe 在这个粒度下不受益 |
+| dispatch_io | -70% | dispatch_data 管理开销过高 |
+| mmap expert files | -5x | 冷页 fault 太重 |
+| Speculative early routing | -38% | 污染 cache |
+| MTP speculative decoding | 接近持平 | MoE I/O 不像 dense 模型那样受益 |
+
+## 安全性与资源控制
+
+这是主力开发机，所以引擎对资源有明确约束：
+
+- 非-expert 权重：约 5.5GB，只读 `mmap`
+- Metal scratch buffers：约 200MB
+- 总常驻内存：约 6GB
+- 剩余大量内存留给系统和 page cache
+- 不做自定义大缓存，避免 OOM 与复杂失控行为
+
+---
+
+<a id="en"></a>
+
+# Flash-MoE: Running a 397B Parameter Model on a Laptop
+
+[![中文](https://img.shields.io/badge/中文-Switch-blue)](#zh-cn)
+[![English](https://img.shields.io/badge/English-Default-black)](#en)
+
+> **[Read the paper](paper/flash_moe.pdf)** for the full technical details, 90+ experiments, and the story behind the system.
+
+Flash-MoE is a pure C / Metal inference engine for **Qwen3.5-397B-A17B**, designed to run on Apple Silicon laptops by streaming 209GB of MoE expert weights directly from SSD.
+
+## Results
+
+![Progress](progress.png)
+
+| Configuration | tok/s | Quality | Notes |
+|---|---:|---|---|
+| 4-bit experts, FMA kernel | **4.36** | Excellent | Best overall configuration, suitable for tool calling |
+| 4-bit experts, baseline | 3.90 | Excellent | Before the FMA optimization |
+| 2-bit experts, trust OS | 5.74 | Good* | Faster, but unreliable for structured output |
+| 2-bit peak single token | 7.05 | Good* | Warm-cache burst, not the recommended default |
+
+\* 2-bit quantization hurts JSON / tool-calling reliability. Use 4-bit by default.
+
+## Quick Start
+
+This is the shortest setup path that matches the codebase as it exists today.
+
+### 1. Prepare the model snapshot
+
+Use a Hugging Face snapshot directory containing:
+
+- `model.safetensors.index.json`
+- `model-xxxxx-of-xxxxx.safetensors`
+- `tokenizer.json`
+
+Example:
+
+```bash
+MODEL_DIR="/Volumes/SSD1T/projects/hf_cache/hub/models--mlx-community--Qwen3.5-397B-A17B-4bit/snapshots/39159bd8aa74f5c8446d2b2dc584f62bb51cb0d3"
+```
+
+### 2. Build `expert_index.json`
+
+```bash
+cd /Volumes/SSD1T/projects/flash-moe
+python3 make_expert_index.py \
+  --model-dir "$MODEL_DIR" \
+  --out expert_index.json
+```
+
+Generate this file on the target machine. It stores the machine-local `model_path`.
+
+### 3. Pack 4-bit experts
+
+```bash
+cd /Volumes/SSD1T/projects/flash-moe
+python3 repack_experts.py --index /Volumes/SSD1T/projects/flash-moe/expert_index.json
+```
+
+Output directory:
+
+```bash
+$MODEL_DIR/packed_experts/
+```
+
+### 4. Optional: build 2-bit experts
+
+```bash
+cd /Volumes/SSD1T/projects/flash-moe/metal_infer
+python3 repack_experts_2bit.py
+```
+
+Output directory:
+
+```bash
+$MODEL_DIR/packed_experts_2bit/
+```
+
+### 5. Export `vocab.bin`
+
+```bash
+cd /Volumes/SSD1T/projects/flash-moe/metal_infer
+python3 export_vocab.py "$MODEL_DIR/tokenizer.json" vocab.bin
+```
+
+Required local files for `infer`:
+
+- `metal_infer/model_weights.bin`
+- `metal_infer/model_weights.json`
+- `metal_infer/tokenizer.bin`
+- `metal_infer/vocab.bin`
+
+### 6. Build `infer`
+
+```bash
+cd /Volumes/SSD1T/projects/flash-moe/metal_infer
+make infer
+```
+
+### 7. Run 4-bit inference
+
+Default example: Chinese
+
+```bash
+./infer --prompt "你好，做个自我介绍" --tokens 64
+```
+
+Switch to English:
+
+```bash
+./infer --prompt "Hi, introduce yourself briefly." --tokens 64
+```
+
+If you want to force the model path explicitly:
+
+```bash
+./infer \
+  --model "$MODEL_DIR" \
+  --prompt "Hi, introduce yourself briefly." \
+  --tokens 64
+```
+
+### 8. Run 2-bit inference
+
+```bash
+./infer --prompt "Hi, introduce yourself briefly." --tokens 64 --2bit
+```
+
+Expected signals:
+
+- `Quant:    2-bit experts`
+- `[experts] 60/60 packed layer files available`
+
+### 9. Interactive chat
+
+```bash
+make chat
+./chat
+```
+
+## Common Failures
 
 `zsh: no such file or directory: ./infer`
 
@@ -215,81 +447,23 @@ make chat
 
 `ERROR: Cannot open vocab vocab.bin`
 
-- Run `python3 export_vocab.py "$MODEL_DIR/tokenizer.json" vocab.bin` in `metal_infer/`.
+- Run:
+
+```bash
+python3 export_vocab.py "$MODEL_DIR/tokenizer.json" vocab.bin
+```
 
 `[experts] 0/60 packed layer files available`
 
-- `packed_experts/` was not generated, or `infer` is pointing at the wrong model directory.
-- Regenerate `expert_index.json` on this machine and verify it contains the correct `model_path`.
+- `packed_experts/` was not generated, or `infer` is reading the wrong model path.
 
-`FileNotFoundError: 找不到 ... model.safetensors.index.json`
+`FileNotFoundError: ... model.safetensors.index.json`
 
-- Your `--model-dir` path is wrong, or you accidentally split the path across lines inside the quotes.
+- Your `--model-dir` path is wrong, or you accidentally broke the path across lines inside the quotes.
 
-### 11. Performance / Quality Notes
+## Notes
 
-- 4-bit is the default production path.
+- 4-bit is the production default.
 - 2-bit is mainly for speed experiments.
-- `--prompt` now uses the chat template path, so direct Chinese and English prompts work without manually adding `<|im_start|>` tags.
+- `--prompt` now goes through the chat-template path, so both Chinese and English prompts work directly.
 
-## Project Structure
-
-```
-metal_infer/
-  infer.m              # Complete inference engine (~7000 lines)
-  shaders.metal        # Metal compute kernels (~1200 lines)
-  chat.m               # Interactive chat TUI with tool calling
-  tokenizer.h          # C BPE tokenizer (single-header, 449 lines)
-  main.m               # MoE-only benchmark
-  Makefile             # Build system
-  extract_weights.py   # Creates model_weights.bin from safetensors
-  repack_experts_2bit.py  # 4-bit → 2-bit expert requantization
-  train_predictor.py   # Expert routing prediction analysis
-  model_weights.bin    # Non-expert weights (5.5GB, mmap'd)
-  model_weights.json   # Tensor manifest
-  vocab.bin            # Vocabulary for token decoding
-  tokenizer.bin        # Pre-exported BPE tokenizer data
-
-repack_experts.py      # 4-bit expert packing from safetensors
-progress.py            # Results visualization (Q2/Q4 tracks)
-results.tsv            # Experiment log (58 experiments)
-```
-
-## What We Tried (and What Worked)
-
-### Kept
-| Approach | Result | Impact |
-|----------|--------|--------|
-| FMA dequant kernel | GPU compute -12% | **+12% tok/s** |
-| Trust OS page cache | Deleted Metal LRU → +38% | **Foundational** |
-| GPU combine+norm in CMD3 | Eliminates CPU round-trip | **Pipeline** |
-| BLAS delta-net (Accelerate) | cpu_attn 0.78→0.28ms | **+64% attn** |
-| F_NOCACHE for 2-bit | +3% from avoiding page thrash | **2-bit only** |
-| GPU fused attention (RoPE) | +2% for full-attn layers | **Small** |
-| C BPE tokenizer | 180ms vs 3500ms startup | **20x startup** |
-| Deferred CMD3 execution | GPU/CPU overlap | **Pipeline** |
-
-### Discarded (58 experiments, highlights)
-| Approach | Result | Why |
-|----------|--------|-----|
-| LZ4 expert compression | -13% | Decompress overhead > warm cache savings |
-| F_RDADVISE prefetch | net 0% | Unified memory: SSD DMA slows GPU -73% |
-| Temporal expert prediction | -18% | 25% hit rate, SSD bandwidth waste |
-| MLP routing predictor | 31% accuracy | Worse than temporal baseline |
-| GPU LUT dequant kernel | -2% | Indirect register access serializes |
-| GPU private buffer compression | -20% pipeline | Blit cost 4×7MB > matvec savings |
-| Spin-poll GPU wait | -23% | CPU thermal competes with GPU |
-| Expert file clustering | 0% | NVMe ignores scatter at 7MB granularity |
-| dispatch_io | -70% | dispatch_data management overhead |
-| mmap expert files | -5x | Per-page fault overhead on cold data |
-| Speculative early routing | -38% | Cache pollution + overhead |
-| MTP speculative decoding | break-even | MoE I/O scales per-token (unlike dense) |
-
-## Safety
-
-This is a primary development machine. The engine explicitly controls memory:
-- Non-expert weights: 5.5GB (mmap'd, read-only)
-- Metal scratch buffers: ~200MB
-- Total: ~6GB, leaving 42GB for OS + page cache
-- No OOM risk. Expert data streams from SSD on demand.
-- No custom caches. Trust the OS.
